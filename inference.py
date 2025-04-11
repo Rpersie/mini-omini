@@ -506,7 +506,8 @@ class OmniInference:
 
 
 def test_infer():
-    device = "cuda:0"
+    # device = "cuda:0"
+    device = "cpu"
     out_dir = f"./output/{get_time_str()}"
     ckpt_dir = f"./checkpoint"
     if not os.path.exists(ckpt_dir):
@@ -515,12 +516,13 @@ def test_infer():
 
     fabric, model, text_tokenizer, snacmodel, whispermodel = load_model(ckpt_dir, device)
 
-    task = ['A1A2', 'asr', "T1A2", "AA-BATCH", 'T1T2', 'AT']
+    # task = ['A1A2', 'asr', "T1A2", "AA-BATCH", 'T1T2', 'AT']
+    task = ["AT"]
 
     # prepare test data
     # TODO
     test_audio_list = sorted(os.listdir('./data/samples'))
-    test_audio_list = [os.path.join('./data/samples', path) for path in test_audio_list]
+    test_audio_list = [(os.path.join('./data/samples', path)).replace('\\', '/') for path in test_audio_list]
     test_audio_transcripts = [
         "What is your name?",
         "what are your hobbies?",

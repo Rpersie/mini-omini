@@ -7,10 +7,10 @@ soundfile==0.12.1
 openai-whisper
 tokenizers==0.19.1 
 streamlit==1.37.1
-# PyAudio==0.2.14
+PyAudio==0.2.14
 pydub==0.25.1
 onnxruntime==1.19.0
-# numpy==1.26.3
+numpy==1.26.3
 gradio==4.42.0
 librosa==0.10.2.post1
 flask==3.0.3

@@ -101,6 +101,9 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def concat_whisper_feat(self, audio_feature, input_ids, T, task):
+        #因为刚开始的特征的前面7个代表的是audio token,最原始的是他们都是padtoken
+        #所以这个地方做的操作是将whisper的输出替换到这个token上面去，也就是109行做的操作
+        #len(T)=1,T代表了时间
         for j in range(len(T)):
             if task[j] != "T1T2" and task[j] != "T1A2":
                 for i in range(7):

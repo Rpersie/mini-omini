@@ -29,26 +29,29 @@ from huggingface_hub import snapshot_download
 torch.set_printoptions(sci_mode=False)
 
 
-# TODO
-text_vocabsize = 151936
-text_specialtokens = 64
-audio_vocabsize = 4096
-audio_specialtokens = 64
+# 词表大小定义
+text_vocabsize = 151936  # 文本词表大小,包含所有可能的文本token
+text_specialtokens = 64  # 文本特殊标记数量
+audio_vocabsize = 4096   # 音频词表大小,用于音频的离散表示
+audio_specialtokens = 64 # 音频特殊标记数量
 
-padded_text_vocabsize = text_vocabsize + text_specialtokens
-padded_audio_vocabsize = audio_vocabsize + audio_specialtokens
+# 填充后的总词表大小
+padded_text_vocabsize = text_vocabsize + text_specialtokens   # 文本词表+特殊标记的总大小
+padded_audio_vocabsize = audio_vocabsize + audio_specialtokens # 音频词表+特殊标记的总大小
 
-_eot = text_vocabsize
-_pad_t = text_vocabsize + 1
-_input_t = text_vocabsize + 2
-_answer_t = text_vocabsize + 3
-_asr = text_vocabsize + 4
+# 文本相关的特殊标记
+_eot = text_vocabsize      # End of Text,文本结束标记
+_pad_t = text_vocabsize + 1  # Text Padding,文本填充标记
+_input_t = text_vocabsize + 2  # Text Input,文本输入标记
+_answer_t = text_vocabsize + 3  # Text Answer,文本回答标记
+_asr = text_vocabsize + 4  # ASR专用标记,用于语音识别任务
 
-_eoa = audio_vocabsize
-_pad_a = audio_vocabsize + 1
-_input_a = audio_vocabsize + 2
-_answer_a = audio_vocabsize + 3
-_split = audio_vocabsize + 4
+# 音频相关的特殊标记
+_eoa = audio_vocabsize      # End of Audio,音频结束标记
+_pad_a = audio_vocabsize + 1  # Audio Padding,音频填充标记
+_input_a = audio_vocabsize + 2  # Audio Input,音频输入标记
+_answer_a = audio_vocabsize + 3  # Audio Answer,音频回答标记
+_split = audio_vocabsize + 4  # 音频分隔标记,用于分隔不同的音频片段
 
 
 def get_input_ids_TA(text, text_tokenizer):

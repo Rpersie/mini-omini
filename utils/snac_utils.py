@@ -18,6 +18,39 @@ def get_time_str():
 
 
 def layershift(input_id, layer, stride=4160, shift=152000):
+    """对token进行层级偏移,使不同层的token具有唯一标识
+    
+    这个函数的设计基于词表大小:
+    - text_vocabsize = 151936 (文本词表)
+    - text_specialtokens = 64
+    - audio_vocabsize = 4096 (音频词表)
+    - audio_specialtokens = 64
+    
+    参数:
+        input_id: 原始token ID
+        layer: 层号(0-6)
+        stride: 层间偏移量,等于padded_audio_vocabsize(4096+64=4160)
+        shift: 基础偏移量,接近text_vocabsize(151936),用于将音频token映射到文本空间后
+    
+    工作原理:
+    1. shift(152000)将音频token映射到文本词表空间之后
+    2. stride(4160)确保每层token都在不同的ID范围内
+    3. 最终token = 原始token + 基础偏移 + (层号*层间偏移)
+    
+    举例:
+    如果原始音频token是100:
+    - 第0层: 100 + 152000 = 152100
+    - 第1层: 100 + 152000 + 4160 = 156260
+    - 第2层: 100 + 152000 + 4160*2 = 160420
+    
+    这种设计确保:
+    1. 每层token都有唯一的ID范围,不会重叠
+    2. 可以通过ID值反推token所属的层
+    3. 保持音频token和文本token的清晰分离
+    """
+    # 计算最终的token ID:
+    # 1. 基础偏移shift确保与文本token不重叠
+    # 2. layer * stride确保不同层的token范围不重叠
     return input_id + shift + layer * stride
 
     

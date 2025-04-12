@@ -108,22 +108,51 @@ def get_input_ids_whisper(
     mel, leng, whispermodel, device, 
     special_token_a=_answer_a, special_token_t=_answer_t,
 ):
-
+    """使用Whisper模型处理音频输入并准备模型输入格式
+    
+    该函数完成两个主要任务:
+    1. 使用Whisper模型从mel频谱图中提取音频特征
+    2. 构建8层的输入ID结构(7层音频+1层文本)
+    
+    参数:
+        mel: 输入的mel频谱图
+        leng: 音频长度
+        whispermodel: Whisper模型实例
+        device: 计算设备(CPU/GPU)
+        special_token_a: 音频特殊标记,默认为_answer_a
+        special_token_t: 文本特殊标记,默认为_answer_t
+    
+    返回:
+        tuple: (audio_feature, input_ids)
+            - audio_feature: Whisper提取的音频特征, shape为(1, T, dim)
+            - input_ids: 8个tensor的列表,每个tensor shape为(1, seq_len)
+    """
+    # 使用Whisper模型提取音频特征
     with torch.no_grad():
-        mel = mel.unsqueeze(0).to(device)
-        # audio_feature = whisper.decode(whispermodel,mel, options).audio_features
-        audio_feature = whispermodel.embed_audio(mel)[0][:leng]
+        mel = mel.unsqueeze(0).to(device)  # 增加batch维度并移至目标设备
+        audio_feature = whispermodel.embed_audio(mel)[0][:leng]  # 提取特征并截取指定长度
 
+    # 获取序列长度T(用于构建填充序列)
     T = audio_feature.size(0)
+    
+    # 构建8层输入ID结构
     input_ids = []
+    
+    # 构建前7层(音频层)
+    # 每层格式: [输入标记] + [填充标记]*T + [结束标记] + [特殊标记]
     for i in range(7):
         input_ids_item = []
-        input_ids_item.append(layershift(_input_a, i))
-        input_ids_item += [layershift(_pad_a, i)] * T
-        input_ids_item += [(layershift(_eoa, i)), layershift(special_token_a, i)]
+        input_ids_item.append(layershift(_input_a, i))  # 音频输入标记
+        input_ids_item += [layershift(_pad_a, i)] * T   # 填充标记
+        input_ids_item += [(layershift(_eoa, i)), layershift(special_token_a, i)]  # 结束标记和特殊标记
         input_ids.append(torch.tensor(input_ids_item).unsqueeze(0))
+    
+    # 构建第8层(文本层)
+    # 格式: [输入标记] + [填充标记]*T + [结束标记] + [特殊标记]
     input_id_T = torch.tensor([_input_t] + [_pad_t] * T + [_eot, special_token_t])
     input_ids.append(input_id_T.unsqueeze(0))
+    
+    # 返回音频特征和处理后的输入ID
     return audio_feature.unsqueeze(0), input_ids
 
 

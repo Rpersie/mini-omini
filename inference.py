@@ -68,15 +68,38 @@ def get_input_ids_TA(text, text_tokenizer):
 
 
 def get_input_ids_TT(text, text_tokenizer):
+    """为文本到文本(T1T2)任务准备模型输入
+    
+    由于模型使用统一的多模态架构,即使是纯文本任务也需要构建8层结构:
+    - 前7层是音频层(但实际是填充)
+    - 第8层是实际的文本输入层
+    
+    参数:
+        text (str): 输入文本
+        text_tokenizer: 用于将文本转换为token的分词器
+    
+    返回:
+        list[tensor]: 8个tensor组成的列表,每个tensor shape为(1, seq_len)
+    """
+    # 创建8层结构(7层音频+1层文本)
     input_ids_item = [[] for i in range(8)]
+    
+    # 将输入文本转换为token序列
     text_tokens = text_tokenizer.encode(text).tolist()
 
+    # 构建前7层(音频层),全部使用填充token
+    # 每一层的token都要经过layershift处理以区分不同层
     for i in range(7):
+        # 长度为 len(text_tokens) + 3,是为了匹配最后文本层的长度
+        # +3 对应文本层的 [_input_t], [_eot], [_answer_t] 三个特殊标记
         input_ids_item[i] = torch.tensor(
             [layershift(_pad_a, i)] * (len(text_tokens) + 3)
-        ).unsqueeze(0)
+        ).unsqueeze(0)  # 增加batch维度变成(1, seq_len)
+    
+    # 构建第8层(文本层),格式为:
+    # [输入标记] + [文本token序列] + [结束标记] + [回答标记]
     input_ids_item[-1] = [_input_t] + text_tokens + [_eot] + [_answer_t]
-    input_ids_item[-1] = torch.tensor(input_ids_item[-1]).unsqueeze(0)
+    input_ids_item[-1] = torch.tensor(input_ids_item[-1]).unsqueeze(0)  # 增加batch维度
 
     return input_ids_item
 

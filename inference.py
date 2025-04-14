@@ -245,8 +245,47 @@ def A1_A2_batch(fabric, audio_feature, input_ids, leng, model, text_tokenizer, s
 
 
 def A1_T2(fabric, audio_feature, input_ids, leng, model, text_tokenizer, step):
+    """音频到文本的转换函数(Audio to Text)
+    
+    该函数将输入的音频转换为对应的文本响应。这是一个对话式转换,
+    不同于ASR的直接转录,它会根据音频内容生成相应的回答。
+    
+    参数:
+        fabric: PyTorch Lightning的fabric实例,用于模型计算管理
+        audio_feature: Whisper提取的音频特征, shape为(1, T, dim)
+        input_ids: 8层输入ID列表,包含7层音频和1层文本
+        leng: 音频序列长度
+        model: 预训练的转换模型
+        text_tokenizer: 文本分词器,用于将token转换回文本
+        step: 当前处理的步骤编号
+    
+    返回:
+        str: 生成的文本响应
+    
+    工作流程:
+    1. 初始化模型的KV缓存
+    2. 调用generate_AT进行音频到文本的生成
+    3. 将生成的token解码为文本
+    """
+    # 初始化模型的KV缓存,设置batch_size=1
     with fabric.init_tensor():
         model.set_kv_cache(batch_size=1)
+    
+    # 调用generate_AT函数生成文本token序列
+    # generate_AT的参数说明:
+    # - model: 预训练模型
+    # - audio_feature: 音频特征
+    # - input_ids: 分层输入ID
+    # - [leng]: 音频长度列表
+    # - ["AT"]: 任务类型标识
+    # - max_returned_tokens: 最大返回token数
+    # - temperature: 采样温度,控制生成的随机性
+    # - top_k: 只保留概率最高的k个token
+    # - eos_id_a/t: 音频/文本的结束标记
+    # - pad_id_t: 文本的填充标记
+    # - shift: token的偏移量
+    # - include_prompt: 是否包含提示在输出中
+    # - generate_text: 是否生成文本
     tokenlist = generate_AT(
         model,
         audio_feature,
@@ -263,6 +302,8 @@ def A1_T2(fabric, audio_feature, input_ids, leng, model, text_tokenizer, step):
         include_prompt=True,
         generate_text=True,
     )
+    
+    # 将生成的token序列解码为文本,并去除首尾空白
     return text_tokenizer.decode(torch.tensor(tokenlist)).strip()
 
 

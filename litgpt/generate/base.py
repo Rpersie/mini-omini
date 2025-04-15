@@ -20,18 +20,39 @@ def multinomial_num_samples_1(probs: torch.Tensor) -> torch.Tensor:
 
 
 def sample_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """top-p(nucleus)采样的具体实现
+    
+    只保留累积概率超过top_p的最小token集合,将其他token的概率设为-inf。
+    
+    参数:
+        logits: 原始logits
+        top_p: 累积概率阈值(0.0~1.0)
+    
+    返回:
+        torch.Tensor: 过滤后的logits
+    
+    实现步骤:
+    1. 对logits按概率从小到大排序
+    2. 计算softmax概率的累积和
+    3. 找出累积概率<=1-top_p的token
+    4. 将这些token的概率设为-inf
+    """
+    # 按概率从小到大排序
     sorted_logits, sorted_indices = torch.sort(logits, descending=False)
     cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-    # Example:
-    # sorted_probs=[0.1, 0.15, 0.2, 0.25, 0.3] -> sorted_cumprobs=[0.1, 0.25, 0.45, 0.7, 1.0]
-    # sorted_indices_to_remove = [1, 1, 0, 0, 0] if top_p=0.7
+    
+    # 找出需要过滤的token
     sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
-    # Keep at least 1 token always to prevent the case where no token is selected
-    # In this case the most probable one is always kept
+    
+    # 保证至少保留一个token(概率最大的)
     sorted_indices_to_remove[-1:] = 0
+    
+    # 将过滤结果映射回原始顺序
     indices_to_remove = sorted_indices_to_remove.scatter(
         0, sorted_indices, sorted_indices_to_remove
     )
+    
+    # 将被过滤token的概率设为-inf
     logits = logits.masked_fill(indices_to_remove, float("-inf"))
     return logits
 
@@ -42,23 +63,57 @@ def sample(
     top_k: Optional[int] = None,
     top_p: float = 1.0,
 ) -> torch.Tensor:
+    """token采样函数
+    
+    该函数实现了多种采样策略来从logits中生成下一个token。
+    支持greedy、temperature和top-p采样,可以组合使用。
+    
+    参数:
+        logits: 模型输出的logits,shape为(batch_size, seq_len, vocab_size)
+        temperature: 控制采样随机性的温度参数
+                    - temperature=0.0: greedy采样
+                    - temperature>0.0: 使用temperature对logits进行缩放
+        top_k: 只保留概率最高的k个候选,其他设为-inf
+        top_p: 累积概率阈值采样(nucleus sampling)
+               - 只保留累积概率超过top_p的最小token集合
+               - top_p=1.0表示保留所有token
+    
+    返回:
+        torch.Tensor: 采样得到的token id
+    
+    采样流程:
+    1. 取最后一个位置的logits
+    2. 可选的top-k过滤
+    3. 可选的temperature缩放
+    4. 可选的top-p过滤
+    5. 根据最终的概率分布采样
+    """
     if top_p < 0.0 or top_p > 1.0:
         raise ValueError(f"top_p must be in [0, 1], got {top_p}")
+    
+    # 只使用最后一个位置的logits
     logits = logits[0, -1]
-    # optionally crop the logits to only the top k options
+    
+    # top-k过滤:只保留概率最高的k个候选
     if top_k is not None:
         v, i = torch.topk(logits, min(top_k, logits.size(-1)))
-        # do not use `torch.where` as in nanogpt because it will repeat top-k collisions
         logits = torch.full_like(logits, float("-inf")).scatter_(-1, i, v)
-    # optionally scale the logits and sample from a probability distribution
+    
+    # temperature采样和top-p采样
     if temperature > 0.0 or top_p > 0.0:
+        # temperature缩放
         if temperature > 0.0:
             logits = logits / temperature
-        # optionally crop the logits to smallest set of logits with a cumulative probability above top_p
+            
+        # top-p(nucleus)采样
         if top_p < 1.0:
             logits = sample_top_p(logits, top_p)
+            
+        # 计算softmax概率并采样
         probs = torch.nn.functional.softmax(logits, dim=-1)
         return multinomial_num_samples_1(probs)
+        
+    # 如果temperature=0且top_p=0,使用greedy采样
     return torch.argmax(logits, dim=-1, keepdim=True)
 
 
@@ -173,21 +228,48 @@ def next_token_batch(
     input_pos: torch.Tensor,
     **kwargs: Any,
 ) -> torch.Tensor:
+    """批处理模式下的token生成函数
+    
+    该函数实现了批处理模式下的token生成功能,可以同时处理多个序列。
+    主要用于音频到文本的转换任务,支持同时生成7层音频token和1层文本token。
+    
+    参数:
+        model: GPT模型实例
+        audio_features: Whisper提取的音频特征,在自回归阶段可以为None
+        input_ids: 8层输入ID列表,每层包含两个批次的输入
+        whisper_lens: 音频特征的长度列表,在自回归阶段可以为None
+        task: 任务类型标识列表,如["A1T2", "A1T2"]
+        input_pos: 当前位置的tensor
+        **kwargs: 其他参数,包括temperature、top_k等采样参数
+    
+    返回:
+        tuple: (音频token列表, 文本token)
+        - 音频token列表包含7个tensor,对应7层音频
+        - 文本token为单个tensor
+    """
+    # 将输入移动到模型所在设备
     input_pos = input_pos.to(model.device)
     input_ids = [input_id.to(model.device) for input_id in input_ids]
+    
+    # 模型前向传播,获取音频和文本的logits
     logits_a, logit_t = model(
         audio_features, input_ids, input_pos, whisper_lens=whisper_lens, task=task
     )
 
+    # 处理音频logits的维度,保留第一个批次的结果
     for i in range(7):
         logits_a[i] = logits_a[i][0].unsqueeze(0)
+    # 处理文本logits的维度,取第二个批次的结果
     logit_t = logit_t[1].unsqueeze(0)
 
+    # 对每层音频logits进行采样,生成下一个token
     next_audio_tokens = []
     for logit_a in logits_a:
         next_a = sample(logit_a, **kwargs).to(dtype=input_ids[0].dtype)
         next_audio_tokens.append(next_a)
+    # 对文本logits进行采样,生成下一个token
     next_t = sample(logit_t, **kwargs).to(dtype=input_ids[0].dtype)
+    
     return next_audio_tokens, next_t
 
 
@@ -373,7 +455,42 @@ def generate_TA_BATCH(
     include_prompt: bool = True,
     generate_text=False,
 ) -> torch.Tensor:
-
+    """批处理模式下的文本到音频生成函数
+    
+    该函数实现了批处理模式下的文本到音频转换功能。它可以同时处理多个序列,
+    支持并行生成7层音频token和1层文本token,提高了生成效率。
+    
+    参数:
+        model: GPT模型实例
+        audio_features: Whisper提取的音频特征,shape为(batch_size, T, dim)
+        input_ids: 8层输入ID列表,每层包含batch_size个序列
+        leng: 音频长度列表
+        task: 任务类型标识列表
+        max_returned_tokens: 最大生成token数,默认1000
+        temperature: 采样温度,控制随机性,默认1.0
+        top_k: 只保留概率最高的k个候选,默认None
+        top_p: 累积概率阈值采样,默认1.0
+        eos_id_a: 音频结束标记
+        eos_id_t: 文本结束标记
+        pad_id_t: 文本填充标记
+        shift: token偏移量
+        include_prompt: 是否包含提示在输出中
+        generate_text: 是否生成文本
+    
+    返回:
+        list[list]: 8个列表组成的列表,包含7层音频token和1层文本token
+    
+    工作流程:
+    1. 初始化模型状态和输出列表
+    2. 使用next_token_batch生成第一组token
+    3. 进入自回归生成循环:
+       - 准备模型输入(7层音频+1层文本)
+       - 生成下一组token
+       - 处理文本结束标记
+       - 检查音频结束条件
+       - 更新输出和位置编码
+    """
+    # 获取输入序列长度和设备信息
     T = input_ids[0].size(1)
     device = input_ids[0].device
     assert max_returned_tokens > T
@@ -382,44 +499,52 @@ def generate_TA_BATCH(
             f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}"
         )
 
+    # 初始化位置编码和输出列表
     input_pos = torch.tensor([T], device=device)
     model_input_ids = input_ids
+    list_output = [[] for i in range(8)]  # 8个列表用于存储不同层的输出
 
-    list_output = [[] for i in range(8)]
-
+    # 生成第一组token
     tokens_A, token_T = next_token_batch(
         model,
         audio_features.to(torch.float32).to(model.device),
         input_ids,
-        [T - 3, T - 3],
-        ["A1T2", "A1T2"],
+        [T - 3, T - 3],  # 两个批次的位置偏移
+        ["A1T2", "A1T2"],  # 两个相同的任务标识
         input_pos=torch.arange(0, T, device=device),
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
     )
 
+    # 保存第一组token到输出列表
     for i in range(7):
         list_output[i].append(tokens_A[i].tolist()[0])
     list_output[7].append(token_T.tolist()[0])
 
+    # 准备下一步的模型输入
     model_input_ids = [[] for i in range(8)]
     for i in range(7):
+        # 对音频token进行位置编码处理
         tokens_A[i] = tokens_A[i].clone() + shift + i * snac_config.padded_vocab_size
         model_input_ids[i].append(tokens_A[i].clone().to(device).to(torch.int32))
         model_input_ids[i].append(torch.tensor([layershift(snac_config.end_of_audio, i)], device=device))
         model_input_ids[i] = torch.stack(model_input_ids[i])
 
+    # 处理文本层的输入
     model_input_ids[-1].append(token_T.clone().to(torch.int32))
     model_input_ids[-1].append(token_T.clone().to(torch.int32))
     model_input_ids[-1] = torch.stack(model_input_ids[-1])
 
+    # 标记文本是否结束
     text_end = False
 
+    # 主生成循环
     for _ in range(2, max_returned_tokens - T + 1):
+        # 生成下一组token
         tokens_A, token_T = next_token_batch(
             model,
-            None,
+            None,  # 自回归阶段不需要音频特征
             model_input_ids,
             None,
             None,
@@ -429,20 +554,25 @@ def generate_TA_BATCH(
             top_p=top_p,
         )
 
+        # 如果文本已结束,使用padding
         if text_end:
             token_T = torch.tensor([pad_id_t], device=device)
 
+        # 检查是否达到结束条件
         if tokens_A[-1] == eos_id_a:
             break
         if token_T == eos_id_t:
             text_end = True
 
+        # 保存生成的token
         for i in range(7):
             list_output[i].append(tokens_A[i].tolist()[0])
         list_output[7].append(token_T.tolist()[0])
 
+        # 准备下一步的输入
         model_input_ids = [[] for i in range(8)]
         for i in range(7):
+            # 对音频token进行位置编码处理
             tokens_A[i] = tokens_A[i].clone() + shift + i * snac_config.padded_vocab_size
             model_input_ids[i].append(tokens_A[i].clone().to(device).to(torch.int32))
             model_input_ids[i].append(
@@ -450,10 +580,12 @@ def generate_TA_BATCH(
             )
             model_input_ids[i] = torch.stack(model_input_ids[i])
 
+        # 处理文本层的输入
         model_input_ids[-1].append(token_T.clone().to(torch.int32))
         model_input_ids[-1].append(token_T.clone().to(torch.int32))
         model_input_ids[-1] = torch.stack(model_input_ids[-1])
 
+        # 更新位置编码
         input_pos = input_pos.add_(1)
 
     return list_output
@@ -478,39 +610,86 @@ def generate_TT(
     include_prompt: bool = True,
     generate_text=False,
 ) -> torch.Tensor:
-
+    """文本到文本的生成函数(Text to Text)
+    
+    该函数实现了文本到文本的生成功能。它只生成文本层的token,
+    而音频层使用end_of_audio标记填充。这种设计使得模型可以专注于
+    文本生成任务,同时保持与其他生成函数的接口一致性。
+    
+    参数:
+        model: GPT模型实例
+        audio_features: 此处为None,因为是文本到文本转换
+        input_ids: 8层输入ID列表(7层音频+1层文本)
+        leng: 此处为None,因为是文本输入
+        task: 任务类型标识
+        max_returned_tokens: 最大生成token数,默认2048
+        temperature: 采样温度,控制随机性,默认1.0
+        top_k: 只保留概率最高的k个候选,默认None
+        top_p: 累积概率阈值采样,默认1.0
+        eos_id_a: 音频结束标记(此处未使用)
+        eos_id_t: 文本结束标记
+        pad_id_t: 文本填充标记
+        shift: token偏移量(此处未使用)
+        include_prompt: 是否包含提示在输出中
+        generate_text: 是否生成文本
+    
+    返回:
+        list: 生成的文本token序列
+    
+    工作流程:
+    1. 获取输入序列长度和设备信息
+    2. 使用next_token_A1T1生成第一个token
+    3. 进入自回归生成循环:
+       - 为音频层填充end_of_audio标记
+       - 生成下一个文本token
+       - 检查是否遇到结束标记
+       - 更新位置编码
+    """
+    # 获取输入序列长度和设备信息
     T = input_ids[0].size(1)
     device = input_ids[0].device
 
+    # 初始化输出列表
     output = []
+    
+    # 生成第一个token
     token_T = next_token_A1T1(
         model,
-        None,
+        None,  # 文本到文本转换不需要音频特征
         input_ids,
-        None,
-        None,
+        None,  # 不需要音频长度
+        None,  # 自回归阶段不需要任务标识
         input_pos=torch.arange(0, T, device=device),
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
     )
 
+    # 保存第一个token
     output.append(token_T.clone().tolist()[0])
+    
+    # 初始化位置编码
     input_pos = torch.tensor([T], device=device)
 
+    # 自回归生成循环
     for _ in tqdm(range(2, max_returned_tokens - T + 1)):
+        # 准备模型输入:为每一层构建输入ID
         model_input_ids = []
         for i in range(7):
+            # 对每一层添加音频结束标记
             model_input_ids.append(
                 torch.tensor([layershift(snac_config.end_of_audio, i)])
                 .view(1, -1)
                 .to(torch.int32)
                 .to(device)
             )
+        # 添加上一步生成的文本token
         model_input_ids.append(token_T.clone().view(1, -1).to(torch.int32).to(device))
+        
+        # 生成下一个token
         token_T = next_token_A1T1(
             model,
-            None,
+            None,  # 自回归阶段不需要音频特征
             model_input_ids,
             None,
             None,
@@ -519,10 +698,15 @@ def generate_TT(
             top_k=top_k,
             top_p=top_p,
         )
+        
+        # 检查是否遇到结束标记
         if token_T == eos_id_t:
             break
+            
+        # 保存生成的token并更新位置编码
         output.append(token_T.clone().tolist()[0])
         input_pos = input_pos.add_(1)
+        
     return output
 
 
@@ -658,43 +842,91 @@ def generate_TA(
     include_prompt: bool = True,
     generate_text=False,
 ) -> torch.Tensor:
-
+    """文本到音频的生成函数(Text to Audio)
+    
+    该函数实现了文本到音频的生成功能,将输入文本转换为对应的音频token序列。
+    它使用自回归方式同时生成7层音频token和1层文本token。
+    
+    参数:
+        model: GPT模型实例
+        audio_features: 此处为None,因为是文本到音频的转换
+        input_ids: 8层输入ID列表(7层音频+1层文本)
+        leng: 此处为None,因为是文本输入
+        task: 任务类型标识
+        max_returned_tokens: 最大生成token数,默认2048
+        temperature: 采样温度,控制随机性,默认1.0
+        top_k: 只保留概率最高的k个候选,默认None
+        top_p: 累积概率阈值采样,默认1.0
+        eos_id_a: 音频结束标记
+        eos_id_t: 文本结束标记
+        pad_id_t: 文本填充标记
+        shift: token偏移量
+        include_prompt: 是否包含提示在输出中
+        generate_text: 是否生成文本
+    
+    返回:
+        list[list]: 8个列表组成的列表,包含7层音频token和1层文本token
+    
+    工作流程:
+    1. 获取输入序列长度和设备信息
+    2. 使用next_token_A1T2生成第一组token
+    3. 进入自回归生成循环:
+       - 准备模型输入(7层音频+1层文本)
+       - 生成下一组token
+       - 处理文本结束标记
+       - 检查音频结束条件
+       - 更新输出和位置编码
+    """
+    # 获取输入序列长度和设备信息
     T = input_ids[0].size(1)
     device = input_ids[0].device
 
+    # 初始化8层输出列表(7层音频+1层文本)
     output = [[] for _ in range(8)]
+    
+    # 生成第一组token
     tokens_A, token_T = next_token_A1T2(
         model,
-        None,
+        None,  # 文本到音频转换不需要音频特征
         input_ids,
-        None,
-        None,
+        None,  # 不需要音频长度
+        None,  # 自回归阶段不需要任务标识
         input_pos=torch.arange(0, T, device=device),
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
     )
+    
+    # 保存第一组token到输出列表
     for i in range(7):
         output[i].append(tokens_A[i].clone().tolist()[0])
     output[7].append(token_T.clone().tolist()[0])
 
+    # 初始化位置编码
     input_pos = torch.tensor([T], device=device)
+    
+    # 标记文本是否结束
     text_end = False
+    
+    # 自回归生成循环
     for _ in tqdm(range(2, max_returned_tokens - T + 1)):
-
+        # 准备下一步的输入
         model_input_ids = []
         for i in range(7):
+            # 对每一层的音频token进行layershift处理
             model_input_ids.append(
                 layershift(tokens_A[i].clone(), i)
                 .view(1, -1)
                 .to(torch.int32)
                 .to(device)
             )
+        # 添加文本层的输入
         model_input_ids.append(token_T.clone().view(1, -1).to(torch.int32).to(device))
 
+        # 生成下一组token
         tokens_A, token_T = next_token_A1T2(
             model,
-            None,
+            None,  # 自回归阶段不需要音频特征
             model_input_ids,
             None,
             None,
@@ -704,18 +936,24 @@ def generate_TA(
             top_p=top_p,
         )
 
+        # 如果文本已结束,使用padding
         if text_end:
             token_T = torch.tensor([pad_id_t], device=device)
 
+        # 检查音频是否结束
         if tokens_A[-1] == eos_id_a:
             break
 
+        # 检查文本是否结束
         if token_T == eos_id_t:
             text_end = True
 
+        # 保存生成的token
         for i in range(7):
             output[i].append(tokens_A[i].clone().tolist()[0])
         output[7].append(token_T.clone().tolist()[0])
+        
+        # 更新位置编码
         input_pos = input_pos.add_(1)
 
     return output
@@ -724,60 +962,77 @@ def generate_TA(
 @torch.inference_mode()
 def generate_AA(
     model: GPT,
-    audio_features: torch.Tensor,
-    input_ids: list,
-    leng,
-    task,
-    max_returned_tokens: int = 2048,
+    audio_features: torch.Tensor,  # 音频特征输入
+    input_ids: list,              # 8层输入ID列表(7层音频+1层文本)
+    leng,                         # 音频长度
+    task,                         # 任务类型标识
+    max_returned_tokens: int = 2048,  # 最大生成token数
     *,
-    temperature: float = 1.0,
-    top_k: Optional[int] = None,
-    top_p: float = 1.0,
-    eos_id_a: Optional[int] = None,
-    eos_id_t: Optional[int] = None,
-    pad_id_t: Optional[int] = None,
-    shift: Optional[int] = None,
-    include_prompt: bool = True,
-    generate_text=False,
+    temperature: float = 1.0,     # 采样温度
+    top_k: Optional[int] = None,  # top-k采样参数
+    top_p: float = 1.0,          # top-p采样参数
+    eos_id_a: Optional[int] = None,  # 音频结束标记
+    eos_id_t: Optional[int] = None,  # 文本结束标记
+    pad_id_t: Optional[int] = None,  # 文本填充标记
+    shift: Optional[int] = None,     # token偏移量
+    include_prompt: bool = True,     # 是否包含提示
+    generate_text=False,             # 是否生成文本
 ) -> torch.Tensor:
-
+    """音频到音频的自回归生成函数
+    
+    该函数实现了音频到音频的自回归生成过程,支持7层并行生成。
+    主要用于A1A2等音频生成任务。
+    """
+    # 获取序列长度和设备信息
     T = input_ids[0].size(1)
     device = input_ids[0].device
 
+    # 初始化输出列表(7层音频+1层文本)
     output = [[] for _ in range(8)]
+    
+    # 生成第一个token
     tokens_A, token_T = next_token_A1T2(
         model,
         audio_features.to(torch.float32).to(model.device),
         input_ids,
-        [T - 3],
+        [T - 3],  # 减3是因为特殊标记占用的位置
         ["A1T2"],
         input_pos=torch.arange(0, T, device=device),
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
     )
+    
+    # 保存第一个token到输出列表
     for i in range(7):
         output[i].append(tokens_A[i].clone().tolist()[0])
     output[7].append(token_T.clone().tolist()[0])
 
+    # 初始化位置编码
     input_pos = torch.tensor([T], device=device)
 
+    # 标记文本是否结束
     text_end = False
+    
+    # 主生成循环
     for _ in tqdm(range(2, max_returned_tokens - T + 1)):
-
+        # 准备下一步的输入
         model_input_ids = []
         for i in range(7):
+            # 对每一层的token进行layershift处理
             model_input_ids.append(
                 layershift(tokens_A[i].clone(), i)
                 .view(1, -1)
                 .to(torch.int32)
                 .to(device)
             )
+        # 添加文本层的输入
         model_input_ids.append(token_T.clone().view(1, -1).to(torch.int32).to(device))
 
+        # 生成下一个token
         tokens_A, token_T = next_token_A1T2(
             model,
-            None,
+            None,  # 自回归阶段不需要音频特征
             model_input_ids,
             None,
             None,
@@ -787,18 +1042,22 @@ def generate_AA(
             top_p=top_p,
         )
 
+        # 如果文本结束,使用padding
         if text_end:
             token_T = torch.tensor([pad_id_t], device=device)
 
+        # 检查是否达到结束条件
         if tokens_A[-1] == eos_id_a:
             break
         if token_T == eos_id_t:
-            # print("text_end")
             text_end = True
 
+        # 保存生成的token
         for i in range(7):
             output[i].append(tokens_A[i].clone().tolist()[0])
         output[7].append(token_T.clone().tolist()[0])
+        
+        # 更新位置编码
         input_pos = input_pos.add_(1)
 
     return output
@@ -823,37 +1082,86 @@ def generate_ASR(
     include_prompt: bool = True,
     generate_text=False,
 ) -> torch.Tensor:
-
+    """语音识别生成函数(Automatic Speech Recognition)
+    
+    该函数实现了音频到文本的直接转录功能,将输入的音频特征转换为对应的文本序列。
+    它使用自回归方式逐token生成,直到遇到结束标记或达到最大长度。
+    
+    参数:
+        model: GPT模型实例
+        audio_features: Whisper提取的音频特征, shape为(1, T, dim)
+        input_ids: 8层输入ID列表(7层音频+1层文本)
+        leng: 音频长度
+        task: 任务类型标识
+        max_returned_tokens: 最大生成token数,默认1200
+        temperature: 采样温度,控制随机性,默认1.0
+        top_k: 只保留概率最高的k个候选,默认None
+        top_p: 累积概率阈值采样,默认1.0
+        eos_id_a: 音频结束标记
+        eos_id_t: 文本结束标记
+        pad_id_t: 文本填充标记
+        shift: token偏移量
+        include_prompt: 是否包含提示在输出中
+        generate_text: 是否生成文本
+    
+    返回:
+        torch.Tensor: 生成的文本token序列
+    
+    工作流程:
+    1. 获取输入序列长度和设备信息
+    2. 使用next_token_A1T1生成第一个token
+    3. 进入自回归生成循环:
+       - 准备模型输入(7层音频end标记+1层文本)
+       - 生成下一个token
+       - 检查是否遇到结束标记
+       - 更新位置编码
+    """
+    # 获取输入序列长度和设备信息
     T = input_ids[0].size(1)
     device = input_ids[0].device
+    
+    # 初始化输出列表
     output = []
+    
+    # 生成第一个token
     token_T = next_token_A1T1(
         model,
         audio_features.to(torch.float32).to(model.device),
         input_ids,
-        [T - 3],
-        ["asr"],
+        [T - 3],  # 减3是因为特殊标记占用的位置
+        ["asr"],  # 使用asr任务标识
         input_pos=torch.arange(0, T, device=device),
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
     )
     output.append(token_T.clone().tolist()[0])
+    
+    # 初始化位置编码
     input_pos = torch.tensor([T], device=device)
+    
+    # 标记文本是否结束
     text_end = False
+    
+    # 自回归生成循环
     for _ in tqdm(range(2, max_returned_tokens - T + 1)):
+        # 准备模型输入:为每一层构建输入ID
         model_input_ids = []
         for i in range(7):
+            # 对每一层添加音频结束标记
             model_input_ids.append(
                 torch.tensor([layershift(snac_config.end_of_audio, i)])
                 .view(1, -1)
                 .to(torch.int32)
                 .to(device)
             )
+        # 添加上一步生成的文本token
         model_input_ids.append(token_T.clone().view(1, -1).to(torch.int32).to(device))
+        
+        # 生成下一个token
         token_T = next_token_A1T1(
             model,
-            None,
+            None,  # 自回归阶段不需要音频特征
             model_input_ids,
             None,
             None,
@@ -862,8 +1170,13 @@ def generate_ASR(
             top_k=top_k,
             top_p=top_p,
         )
+        
+        # 检查是否遇到结束标记
         if token_T == eos_id_t:
             break
+            
+        # 保存生成的token并更新位置编码
         output.append(token_T.clone().tolist()[0])
         input_pos = input_pos.add_(1)
+        
     return output
